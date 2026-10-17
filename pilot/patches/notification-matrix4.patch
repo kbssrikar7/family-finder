@@ -1,0 +1,23 @@
+diff --git a/lib/services/push/notification_display.dart b/lib/services/push/notification_display.dart
+index f1bf0d7..8077b87 100644
+--- a/lib/services/push/notification_display.dart
++++ b/lib/services/push/notification_display.dart
+@@ -103,11 +103,16 @@ class NotificationDisplay {
+ 
+       // Fetch the event from the server
+       final eventJson = await client.getOneRoomEvent(roomId, eventId);
+-      var event = matrix.Event.fromJson(eventJson, room);
++      var event = matrix.Event.fromMatrixEvent(eventJson, room);
+ 
+       // Decrypt if encrypted
+       if (event.type == matrix.EventTypes.Encrypted) {
+-        event = await event.decryptAndVerify();
++        final encryption = client.encryption;
++        if (encryption == null) {
++          await _showGenericNotification(roomId);
++          return;
++        }
++        event = await encryption.decryptRoomEvent(event);
+       }
+ 
+       // Classify the decrypted content

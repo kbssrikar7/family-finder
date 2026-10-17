@@ -1,0 +1,21 @@
+diff --git a/android/build.gradle b/android/build.gradle
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -44,6 +44,17 @@
+                 ndkVersion "28.0.12433566"
+             }
+         }
++        // Plugins pinned to an old compileSdk (flutter_native_splash: 31)
++        // fail checkDebugAarMetadata against current AndroidX. compileSdk
++        // only selects the API headers; minSdk/targetSdk are untouched.
++        if (subproject.plugins.hasPlugin("com.android.library")) {
++            def required = rootProject.ext.compileSdkVersion
++            def declared = subproject.android.compileSdkVersion
++            def level = declared?.startsWith("android-") ? declared.substring(8) : null
++            if (level == null || !level.isInteger() || level.toInteger() < required) {
++                subproject.android.compileSdkVersion required
++            }
++        }
+     }
+ }
+ 

@@ -1,0 +1,38 @@
+name: family-location-pilot
+services:
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.163.0
+    user: "${PILOT_UID:-1000}:${PILOT_GID:-1000}"
+    restart: unless-stopped
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+    volumes:
+      - ./runtime/data:/data
+    ports:
+      - "127.0.0.1:8008:8008"
+      # ntfy shares this network namespace (see below); published here.
+      - "127.0.0.1:8090:8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5).read()"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+
+  # UnifiedPush distributor backend and Matrix push gateway. Phones reach it
+  # at 127.0.0.1:8090 via adb reverse; sharing Synapse's network namespace lets
+  # Synapse deliver pushes to the same 127.0.0.1:8090 URL the phones register.
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    command: serve
+    user: "${PILOT_UID:-1000}:${PILOT_GID:-1000}"
+    restart: unless-stopped
+    network_mode: "service:synapse"
+    depends_on:
+      - synapse
+    environment:
+      NTFY_BASE_URL: http://127.0.0.1:8090
+      NTFY_LISTEN_HTTP: ":8090"
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_CACHE_DURATION: 12h
+    volumes:
+      - ./runtime/ntfy:/var/lib/ntfy

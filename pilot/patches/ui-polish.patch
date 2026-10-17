@@ -1,0 +1,153 @@
+diff --git a/lib/screens/map/map_tab.dart b/lib/screens/map/map_tab.dart
+index 4c52fe5..14b7312 100644
+--- a/lib/screens/map/map_tab.dart
++++ b/lib/screens/map/map_tab.dart
+@@ -1750,6 +1750,13 @@ class _MapTabState extends State<MapTab> with TickerProviderStateMixin, WidgetsB
+ 
+                     if (!_initialZoomCalculated) {
+                       if (_locationManager?.currentLatLng == null) {
++                        // A fresh fix can take ~30s indoors; frame the last
++                        // known position meanwhile instead of the default.
++                        _locationManager?.lastKnownLatLng().then((cached) {
++                          if (cached != null && mounted && !_initialZoomCalculated) {
++                            _mapController.moveAndRotate(cached, 3.5, 0);
++                          }
++                        });
+                         _locationManager?.grabLocationAndPing().then((_) {
+                           if (_locationManager?.currentLatLng != null && mounted) {
+                             _zoom = 3.5;
+diff --git a/lib/services/location/libre_location_service.dart b/lib/services/location/libre_location_service.dart
+index c4e0269..c7c9fd4 100644
+--- a/lib/services/location/libre_location_service.dart
++++ b/lib/services/location/libre_location_service.dart
+@@ -203,6 +203,25 @@ class LibreLocationService implements LocationService {
+     }
+   }
+ 
++  @override
++  Future<LocationUpdate?> getLastKnownPosition() async {
++    try {
++      // maximumAge is in milliseconds; a cached fix of any recent age returns
++      // immediately, otherwise give up quickly rather than wait for GPS.
++      final position = await libre.LibreLocation.getCurrentPosition(
++        accuracy: libre.Accuracy.high,
++        samples: 1,
++        timeout: 2,
++        maximumAge: const Duration(days: 1).inMilliseconds,
++        persist: false,
++      );
++      return _mapPositionToLocationUpdate(position);
++    } catch (e) {
++      print("No last known position: $e");
++      return null;
++    }
++  }
++
+   @override
+   Future<bool> requestPermission() async {
+     try {
+diff --git a/lib/services/location/location_service.dart b/lib/services/location/location_service.dart
+index c5828e6..12ba0b6 100644
+--- a/lib/services/location/location_service.dart
++++ b/lib/services/location/location_service.dart
+@@ -19,6 +19,9 @@ abstract class LocationService {
+   /// Get the current position immediately.
+   Future<LocationUpdate> getCurrentPosition();
+ 
++  /// Cached last known position without waiting for a new fix, or null.
++  Future<LocationUpdate?> getLastKnownPosition();
++
+   /// Request location permissions.
+   Future<bool> requestPermission();
+ 
+diff --git a/lib/services/location_manager.dart b/lib/services/location_manager.dart
+index d37f01f..2cf4aad 100644
+--- a/lib/services/location_manager.dart
++++ b/lib/services/location_manager.dart
+@@ -180,6 +180,15 @@ class LocationManager with ChangeNotifier {
+     notifyListeners();
+   }
+ 
++  /// Last known position for initial map framing. Not broadcast to contacts.
++  Future<LatLng?> lastKnownLatLng() async {
++    final current = currentLatLng;
++    if (current != null) return current;
++    final cached = await _locationService.getLastKnownPosition();
++    if (cached == null) return null;
++    return LatLng(cached.latitude, cached.longitude);
++  }
++
+   // Manually request the current location (e.g., for a "Ping" button)
+   // This ALWAYS gets a fresh location, bypassing any throttling
+   Future<void> grabLocationAndPing() async {
+diff --git a/lib/widgets/add_friend_modal.dart b/lib/widgets/add_friend_modal.dart
+index 3f08cf8..0022aa3 100644
+--- a/lib/widgets/add_friend_modal.dart
++++ b/lib/widgets/add_friend_modal.dart
+@@ -293,7 +293,7 @@ class _AddFriendModalState extends State<AddFriendModal>
+         Navigator.of(context).pop();
+       }
+ 
+-      InAppNotifier.instance.show(
++      final sendingNotice = InAppNotifier.instance.show(
+         title: 'Sending friend request',
+         message: 'Sending to @$handle...',
+         variant: InAppNotificationVariant.info,
+@@ -302,7 +302,9 @@ class _AddFriendModalState extends State<AddFriendModal>
+       unawaited(() async {
+         try {
+           final result =
+-              await roomService.createRoomAndInviteContact(normalizedUserId);
++              await roomService.createRoomAndInviteContact(normalizedUserId)
++                  .whenComplete(() =>
++                      InAppNotifier.instance.dismiss(sendingNotice));
+ 
+           if (!result) {
+             InAppNotifier.instance.show(
+diff --git a/lib/widgets/friend_request_modal.dart b/lib/widgets/friend_request_modal.dart
+index 044ec35..2d026ee 100644
+--- a/lib/widgets/friend_request_modal.dart
++++ b/lib/widgets/friend_request_modal.dart
+@@ -68,7 +68,7 @@ class _FriendRequestModalState extends State<FriendRequestModal> {
+   String get _firstName {
+     final clean = widget.displayName.replaceFirst(RegExp(r'^@'), '').trim();
+     if (clean.isEmpty) return 'them';
+-    final parts = clean.split(RegExp(r'[\s._-]+'));
++    final parts = clean.split(RegExp(r'\s+'));
+     final first = parts.first;
+     if (first.isEmpty) return clean;
+     return first[0].toUpperCase() + first.substring(1);
+diff --git a/lib/widgets/map_scroll_window.dart b/lib/widgets/map_scroll_window.dart
+index f3a36c1..155a334 100644
+--- a/lib/widgets/map_scroll_window.dart
++++ b/lib/widgets/map_scroll_window.dart
+@@ -439,9 +439,10 @@ class _MapScrollWindowState extends State<MapScrollWindow>
+     );
+   }
+ 
++  // Called during build: watch so the tab badges track bloc updates.
+   int _contactsLiveCount() {
+     try {
+-      final s = context.read<ContactsBloc>().state;
++      final s = context.watch<ContactsBloc>().state;
+       if (s is ContactsLoaded) {
+         return s.contacts.length;
+       }
+@@ -451,7 +452,7 @@ class _MapScrollWindowState extends State<MapScrollWindow>
+ 
+   int _groupsCount() {
+     try {
+-      final s = context.read<GroupsBloc>().state;
++      final s = context.watch<GroupsBloc>().state;
+       if (s is GroupsLoaded) return s.groups.length;
+     } catch (_) {}
+     return 0;
+@@ -459,7 +460,7 @@ class _MapScrollWindowState extends State<MapScrollWindow>
+ 
+   int _invitesCount() {
+     try {
+-      final s = context.read<InvitationsBloc>().state;
++      final s = context.watch<InvitationsBloc>().state;
+       if (s is InvitationsLoaded) return s.invitations.length;
+     } catch (_) {}
+     return 0;

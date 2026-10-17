@@ -1,0 +1,15 @@
+# Samsung Find investigation material: third-party APKs, decompiled code and
+# private notes. Never published; only the Grid-related docs below are.
+/artifacts/
+/tools/
+/analysis/*
+!/analysis/grid-source-evaluation.md
+!/analysis/grid-pilot-validation.json
+!/analysis/open-source-research.md
+
+__pycache__/
+*.pyc
+
+# Local pilot source, SDKs, credentials and generated server configuration
+/pilot/.local/
+/pilot/runtime/

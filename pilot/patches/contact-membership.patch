@@ -1,0 +1,166 @@
+diff --git a/lib/blocs/contacts/contacts_bloc.dart b/lib/blocs/contacts/contacts_bloc.dart
+index f236436..75f3f3f 100644
+--- a/lib/blocs/contacts/contacts_bloc.dart
++++ b/lib/blocs/contacts/contacts_bloc.dart
+@@ -157,6 +157,15 @@ class ContactsBloc extends Bloc<ContactsEvent, ContactsState> {
+         if (membershipStatus == null) {
+           membershipStatus = await roomService.getUserRoomMembership(directRoomId, contact.userId);
+           print("ContactsBloc: Contact ${contact.userId} has Matrix membership status: $membershipStatus in room $directRoomId");
++        } else if (membershipStatus == 'invite') {
++          // A stored invite goes stale once the contact accepts. Matrix state
++          // is authoritative for a join; persist it so the fix sticks.
++          final matrixStatus = await roomService.getUserRoomMembership(directRoomId, contact.userId);
++          if (matrixStatus == 'join') {
++            membershipStatus = 'join';
++            await userRepository.updateMembershipStatus(contact.userId, directRoomId, 'join');
++            print("ContactsBloc: Stored invite for ${contact.userId} superseded by Matrix join");
++          }
+         }
+       } else {
+         print("ContactsBloc: No direct room found for contact ${contact.userId}");
+diff --git a/lib/services/room_service.dart b/lib/services/room_service.dart
+index 5bbe63e..4356961 100644
+--- a/lib/services/room_service.dart
++++ b/lib/services/room_service.dart
+@@ -621,8 +621,15 @@ class RoomService {
+         print('Error deleting map icons for room $roomId: $e');
+       }
+ 
+-      // Get all user IDs in the room before deletion
+-      final userIds = matrixUsers.map((p) => p.id).toList();
++      // Get all user IDs in the room before deletion. Include users stored
++      // for this room locally: a contact who already left is no longer a
++      // Matrix participant, and would otherwise linger as a stale contact.
++      final storedRelationships =
++          await userRepository.getUserRelationshipsForRoom(roomId);
++      final userIds = {
++        ...matrixUsers.map((p) => p.id),
++        ...storedRelationships.map((r) => r['userId'] as String),
++      }.toList();
+ 
+       // Get list of direct contacts (these are already GridUsers)
+       final directContacts = await userRepository.getDirectContacts();
+diff --git a/lib/services/sync_manager.dart b/lib/services/sync_manager.dart
+index 17c446d..ed4167f 100644
+--- a/lib/services/sync_manager.dart
++++ b/lib/services/sync_manager.dart
+@@ -934,8 +934,32 @@ class SyncManager with ChangeNotifier {
+             }
+             
+             try {
+-              final room = await roomRepository.getRoomById(roomId);
++              var room = await roomRepository.getRoomById(roomId);
++              if (room == null) {
++                // A room we created to invite this contact may not be stored
++                // locally yet; store it so the join is persisted and our
++                // initial location is sent instead of waiting for a heartbeat.
++                final matrixRoom = client.getRoomById(roomId);
++                if (matrixRoom != null) {
++                  await processJoinedRoom(matrixRoom);
++                  room = await roomRepository.getRoomById(roomId);
++                }
++              }
+               if (room != null) {
++                // Persist the accepted invite, as the state-event join handler
++                // does; ContactsBloc otherwise keeps showing "Invite pending".
++                await userRepository.insertUserRelationship(
++                  event.stateKey!,
++                  roomId,
++                  !room.isGroup, // isDirect
++                  membershipStatus: 'join',
++                );
++                if (room.isGroup) {
++                  groupsBloc.add(UpdateGroup(roomId));
++                } else {
++                  contactsBloc.add(RefreshContacts());
++                }
++
+                 // Check sharing preferences for direct rooms
+                 if (!room.isGroup) {
+                   final sharingPrefs = await sharingPreferencesRepository.getSharingPreferences(event.stateKey!, 'user');
+@@ -1346,9 +1370,14 @@ class SyncManager with ChangeNotifier {
+ 
+     print("Processing leave for user: $userId in room: $roomId");
+     final room = await roomRepository.getRoomById(roomId);
+-
+-    if (room != null) {
+-      if (room.isGroup) {
++    // A direct room can be missing locally (e.g. one we created to invite);
++    // fall back to its Matrix name so the removed contact is still cleaned up.
++    final isDirect = room != null
++        ? !room.isGroup
++        : isDirectRoom(client.getRoomById(roomId)?.name ?? '');
++
++    if (room != null || isDirect) {
++      if (room != null && room.isGroup) {
+         try {
+           // Remove the user from room members list
+           final updatedMembers = room.members.where((id) => id != userId).toList();
+diff --git a/test/blocs/contacts_bloc_test.dart b/test/blocs/contacts_bloc_test.dart
+index ce690ff..86dc23e 100644
+--- a/test/blocs/contacts_bloc_test.dart
++++ b/test/blocs/contacts_bloc_test.dart
+@@ -125,6 +125,63 @@ void main() {
+         ],
+       );
+ 
++      blocTest<ContactsBloc, ContactsState>(
++        'prefers Matrix join over a stale stored invite and persists it',
++        build: () {
++          when(() => mockUserRepository.getDirectContacts())
++              .thenAnswer((_) async => [mockContacts.first]);
++          when(() => mockUserRepository.getDirectRoomForContact(any()))
++              .thenAnswer((_) async => 'room1');
++          when(() => mockUserRepository.getUserRelationshipsForRoom(any()))
++              .thenAnswer((_) async => [
++                    {'userId': 'user1', 'membershipStatus': 'invite'},
++                  ]);
++          when(() => mockRoomService.getUserRoomMembership('room1', 'user1'))
++              .thenAnswer((_) async => 'join');
++          when(() => mockUserRepository.updateMembershipStatus(any(), any(), any()))
++              .thenAnswer((_) async {});
++          return bloc;
++        },
++        act: (bloc) => bloc.add(LoadContacts()),
++        expect: () => [
++          isA<ContactsLoading>(),
++          isA<ContactsLoaded>(),
++        ],
++        verify: (bloc) {
++          final state = bloc.state as ContactsLoaded;
++          expect(state.contacts.single.membershipStatus, equals('join'));
++          verify(() => mockUserRepository.updateMembershipStatus('user1', 'room1', 'join'))
++              .called(1);
++        },
++      );
++
++      blocTest<ContactsBloc, ContactsState>(
++        'keeps a stored invite while Matrix has not synced the membership yet',
++        build: () {
++          when(() => mockUserRepository.getDirectContacts())
++              .thenAnswer((_) async => [mockContacts.first]);
++          when(() => mockUserRepository.getDirectRoomForContact(any()))
++              .thenAnswer((_) async => 'room1');
++          when(() => mockUserRepository.getUserRelationshipsForRoom(any()))
++              .thenAnswer((_) async => [
++                    {'userId': 'user1', 'membershipStatus': 'invite'},
++                  ]);
++          when(() => mockRoomService.getUserRoomMembership('room1', 'user1'))
++              .thenAnswer((_) async => null);
++          return bloc;
++        },
++        act: (bloc) => bloc.add(LoadContacts()),
++        expect: () => [
++          isA<ContactsLoading>(),
++          isA<ContactsLoaded>(),
++        ],
++        verify: (bloc) {
++          final state = bloc.state as ContactsLoaded;
++          expect(state.contacts.single.membershipStatus, equals('invite'));
++          verifyNever(() => mockUserRepository.updateMembershipStatus(any(), any(), any()));
++        },
++      );
++
+       blocTest<ContactsBloc, ContactsState>(
+         'emits [ContactsLoading, ContactsLoaded([])] when no contacts exist',
+         build: () {

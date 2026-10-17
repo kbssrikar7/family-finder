@@ -1,0 +1,25 @@
+diff --git a/lib/screens/settings/settings_page.dart b/lib/screens/settings/settings_page.dart
+index 3b7c079..5d58cde 100644
+--- a/lib/screens/settings/settings_page.dart
++++ b/lib/screens/settings/settings_page.dart
+@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
+ import 'package:grid_frontend/services/room_service.dart';
+ import 'package:provider/provider.dart';
+ import 'package:matrix/matrix.dart';
+-import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+ import '../../services/sync_manager.dart';
+ import '/services/database_service.dart';
+ import 'package:shared_preferences/shared_preferences.dart';
+@@ -2487,7 +2486,11 @@ class _SettingsPageState extends State<SettingsPage> {
+                 ),
+                 _buildSettingsDivider(),
+                 _buildMenuOption(
+-                  icon: FontAwesomeIcons.discord,
++                  icon: const IconData(
++                    0xf392,
++                    fontFamily: 'FontAwesomeBrands',
++                    fontPackage: 'font_awesome_flutter',
++                  ),
+                   title: 'Join our Discord',
+                   onTap: () => _launchURL('https://discord.gg/cJrQXMn6Hk'),
+                   colorScheme: colorScheme,

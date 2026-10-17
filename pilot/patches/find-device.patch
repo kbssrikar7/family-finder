@@ -1,0 +1,1799 @@
+diff --git a/pubspec.yaml b/pubspec.yaml
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -58,6 +58,9 @@
+   firebase_messaging: ^15.1.6
+   flutter_local_notifications: ^18.0.0
+   unifiedpush: ^6.0.1
++  # Find-device screen: compass heading and Bluetooth proximity (BSD-3).
++  flutter_compass: 0.8.1
++  ble_proximity_signal: ^0.2.1
+   google_api_availability: ^5.0.1
+ 
+ 
+diff --git a/android/build.gradle b/android/build.gradle
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -3,7 +3,7 @@
+     ext {
+         compileSdkVersion = 36
+         targetSdkVersion = 36
+-        minSdkVersion = 24
++        minSdkVersion = 26 // ble_proximity_signal (find nearby) requires Android 8.0
+         appCompatVersion = "1.4.2"
+         playServicesLocationVersion = "21.0.1"
+     }
+diff --git a/lib/main.dart b/lib/main.dart
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -1,3 +1,6 @@
++// Keeps findDevicePushMain in the app kernel; PushDispatcher.kt starts it.
++import 'package:grid_frontend/services/find_device/push_background.dart';
++import 'package:grid_frontend/services/find_device/find_device_router.dart';
+ import 'dart:async';
+ 
+ import 'package:flutter/material.dart';
+@@ -214,19 +217,20 @@
+   if (token != null && token.isNotEmpty) {
+     try {
+       client.accessToken = token;
+-
+-      if (client.isLogged()) {
+-        final pushService = PushNotificationService(client: client);
+-        // Network call — never allowed to block first frame.
+-        unawaited(pushService
+-            .register()
+-            .timeout(const Duration(seconds: 15))
+-            .catchError((e) => debugPrint('[Push] register failed: $e')));
+-      }
+     } catch (e) {
+       print('Error restoring session with token: $e');
+     }
+   }
++  // Custom-server sessions have no stored token but still need pushers
++  // (find-device ring and location requests arrive by push).
++  if (client.isLogged()) {
++    final pushService = PushNotificationService(client: client);
++    // Network call — never allowed to block first frame.
++    unawaited(pushService
++        .register()
++        .timeout(const Duration(seconds: 30))
++        .catchError((e) => debugPrint('[Push] register failed: $e')));
++  }
+ 
+   // Initialize notification channels (Android)
+   await _tryBootStep(
+@@ -421,6 +425,8 @@
+                 locationManager: context.read<LocationManager>(),
+                 roomService: roomService,
+               );
++              // Pushes (find-device commands) go through this engine's client.
++              unawaited(FindDeviceRouter.attachMainEngine(client, messageProcessor));
+               return SyncManager(
+                 client,
+                 messageProcessor,
+@@ -463,6 +469,8 @@
+                 locationManager: context.read<LocationManager>(),
+                 roomService: roomService,
+               );
++              // Pushes (find-device commands) go through this engine's client.
++              unawaited(FindDeviceRouter.attachMainEngine(client, messageProcessor));
+               return SyncManager(
+                 client,
+                 messageProcessor,
+diff --git a/lib/services/push_notification_service.dart b/lib/services/push_notification_service.dart
+--- a/lib/services/push_notification_service.dart
++++ b/lib/services/push_notification_service.dart
+@@ -1,8 +1,10 @@
++import 'dart:async';
+ import 'dart:io';
+ import 'package:flutter/foundation.dart';
+ import 'package:matrix/matrix.dart';
+ import 'package:shared_preferences/shared_preferences.dart';
+ import 'package:firebase_messaging/firebase_messaging.dart';
++import 'package:grid_frontend/services/find_device/find_device_channel.dart';
+ 
+ /// Service responsible for registering/unregistering Matrix push notification
+ /// pushers with Synapse via the Matrix SDK's built-in `postPusher` /
+@@ -122,7 +124,7 @@
+       transport: PushTransport.unifiedPush,
+       appId: _androidUnifiedPushAppId,
+       pushkey: endpoint, // ntfy topic URL
+-      dataUrl: Uri.parse(_ntfyGatewayUrl),
++      dataUrl: _matrixGatewayFor(endpoint),
+     );
+   }
+ 
+@@ -252,8 +254,32 @@
+ 
+   /// Get UnifiedPush / ntfy endpoint URL (Android without GMS).
+   Future<String> _getUnifiedPushEndpoint() async {
+-    // TODO: Wire up unifiedpush package when testing on degoogled device
+-    throw UnimplementedError('UnifiedPush not yet wired for testing');
++    final distributor = await FindDeviceChannel.registerPush();
++    if (distributor == null) {
++      throw StateError('No UnifiedPush distributor (e.g. ntfy) is installed');
++    }
++    // The endpoint arrives asynchronously from the distributor.
++    for (var i = 0; i < 40; i++) {
++      final status = await FindDeviceChannel.pushStatus();
++      if (status.endpoint != null) return status.endpoint!;
++      if (status.failure != null) {
++        throw StateError('UnifiedPush registration failed: ${status.failure}');
++      }
++      await Future.delayed(const Duration(milliseconds: 500));
++    }
++    throw TimeoutException('UnifiedPush endpoint not received from $distributor');
++  }
++
++  /// ntfy (and other UnifiedPush servers) expose the Matrix push gateway on
++  /// the endpoint's own origin; fall back to the hosted Grid gateway.
++  Uri _matrixGatewayFor(String endpoint) {
++    final uri = Uri.tryParse(endpoint);
++    if (uri == null || !uri.hasAuthority) return Uri.parse(_ntfyGatewayUrl);
++    return Uri(
++        scheme: uri.scheme,
++        host: uri.host,
++        port: uri.hasPort ? uri.port : null,
++        path: '/_matrix/push/v1/notify');
+   }
+ 
+   Future<String> _deviceDisplayName() async {
+diff --git a/lib/services/message_processor.dart b/lib/services/message_processor.dart
+--- a/lib/services/message_processor.dart
++++ b/lib/services/message_processor.dart
+@@ -7,6 +7,7 @@
+ import 'package:grid_frontend/services/user_device_status_cache.dart';
+ import 'package:matrix/encryption/encryption.dart';
+ import 'package:matrix/matrix.dart';
++import 'package:grid_frontend/services/find_device/device_commands.dart';
+ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+ import 'package:grid_frontend/services/secure_storage_provider.dart';
+ import 'package:shared_preferences/shared_preferences.dart';
+@@ -178,6 +179,15 @@
+       if (decryptedEvent.senderId == client.userID) {
+         return null;
+       }
++      if (decryptedEvent.content['msgtype'] == DeviceCommands.ringMsgtype ||
++          decryptedEvent.content['msgtype'] == DeviceCommands.nearbyMsgtype) {
++        await DeviceCommands.handle(decryptedEvent, room, client.userID);
++        return null;
++      }
++      if (decryptedEvent.content['msgtype'] == DeviceCommands.ringStatusMsgtype) {
++        DeviceCommands.handleStatus(decryptedEvent);
++        return null;
++      }
+       final messageData = {
+         'eventId': decryptedEvent.eventId,
+         'sender': decryptedEvent.senderId,
+@@ -599,15 +609,20 @@
+         print('[Location Request] Outside sharing window for $sender; dropping');
+         return;
+       }
+-      if (!await _cooldown.shouldRespondToLocationRequest(sender)) {
++      // Find-screen requests are live and recent; normal ones are throttled.
++      final sentAt = messageData['timestamp'];
++      final live = content['live'] == true &&
++          sentAt is DateTime &&
++          DateTime.now().difference(sentAt) < const Duration(minutes: 1);
++      if (!live && !await _cooldown.shouldRespondToLocationRequest(sender)) {
+         print('[Location Request] Throttled response to $sender');
+         return;
+       }
+ 
+-      print('[Location Request] Responding to $sender in room $roomId');
+-      await locationManager!.grabLocationAndPing();
++      print('[Location Request] Responding to $sender in room $roomId${live ? ' (live)' : ''}');
++      await locationManager!.grabLocationAndPing(precise: live);
+       await roomService!.updateSingleRoom(roomId);
+-      await _cooldown.markLocationResponded(sender);
++      if (!live) await _cooldown.markLocationResponded(sender);
+     } catch (e) {
+       print('[Location Request] Error handling request: $e');
+     }
+diff --git a/lib/services/android_background_task.dart b/lib/services/android_background_task.dart
+--- a/lib/services/android_background_task.dart
++++ b/lib/services/android_background_task.dart
+@@ -125,23 +125,31 @@
+   }
+ }
+ 
+-Future<void> processBackgroundLocation(
+-  double latitude,
+-  double longitude,
+-  double accuracy,
+-  DateTime timestamp,
+-  bool isMoving, {
+-  double? speed,
+-  double? heading,
+-  double? batteryLevel,
+-  bool? isCharging,
+-}) async {
+-  try {
+-    // Reuse cached instances if available
++/// Matrix client for background isolates (location heartbeats, find-device
++/// pushes), sharing the foreground app's database and encryption keys.
++/// Cached per isolate; returns null when encryption could not be set up.
++Future<Client?> backgroundMatrixClient() {
++  // Concurrent pushes/heartbeats share one initialization; a second
++  // vodozemac/flutter_rust_bridge init in the same isolate throws.
++  final pending = _clientInit;
++  if (pending != null) return pending;
++  final init = _initBackgroundMatrixClient();
++  _clientInit = init;
++  init.then((client) {
++    if (client == null) _clientInit = null; // allow a retry after failure
++  }, onError: (_) => _clientInit = null);
++  return init;
++}
++
++Future<Client?>? _clientInit;
++Future<void>? _vodInit;
++
++Future<Client?> _initBackgroundMatrixClient() async {
+     if (_cachedClient == null) {
+       print('[HeadlessTask] 🔄 Initializing Matrix client (first run)');
+ 
+-      await vod.init();
++      // vodozemac may only be initialized once per isolate.
++      await (_vodInit ??= vod.init());
+ 
+       _cachedDatabaseService = DatabaseService();
+       await _cachedDatabaseService!.initDatabase();
+@@ -166,7 +174,7 @@
+         _cachedClient = null;
+         _cachedDatabase = null;
+         _cachedDatabaseService = null;
+-        return;
++        return null;
+       }
+ 
+       print('[HeadlessTask] ✓ Matrix client initialized and cached (encryption on)');
+@@ -174,6 +182,23 @@
+       print('[HeadlessTask] ⚡ Reusing cached Matrix client (fast path)');
+     }
+ 
++    return _cachedClient;
++}
++
++Future<void> processBackgroundLocation(
++  double latitude,
++  double longitude,
++  double accuracy,
++  DateTime timestamp,
++  bool isMoving, {
++  double? speed,
++  double? heading,
++  double? batteryLevel,
++  bool? isCharging,
++}) async {
++  try {
++    if (await backgroundMatrixClient() == null) return;
++
+     // Initialize repositories (these are lightweight, not cached)
+     final locationRepository = LocationRepository(_cachedDatabaseService!);
+     final userRepository = UserRepository(_cachedDatabaseService!);
+@@ -244,6 +269,7 @@
+     _cachedClient = null;
+     _cachedDatabase = null;
+     _cachedDatabaseService = null;
++    _clientInit = null;
+   }
+ }
+ 
+diff --git a/lib/services/avatar_announcement_service.dart b/lib/services/avatar_announcement_service.dart
+--- a/lib/services/avatar_announcement_service.dart
++++ b/lib/services/avatar_announcement_service.dart
+@@ -345,7 +345,7 @@
+   /// Request location updates from specific users (or all room members).
+   /// Mirrors [requestAvatars]; the response is a regular `m.location` ping
+   /// from the recipient(s).
+-  Future<void> requestLocations(String roomId, {List<String>? userIds}) async {
++  Future<void> requestLocations(String roomId, {List<String>? userIds, bool live = false}) async {
+     try {
+       final room = client.getRoomById(roomId);
+       if (room == null || room.membership != Membership.join) {
+@@ -357,6 +357,8 @@
+         'msgtype': 'm.location.request',
+         'body': 'Requesting location update',
+         'requested_users': userIds,
++        // Find screen open: answer every request with a precise fix.
++        if (live) 'live': true,
+         'timestamp': DateTime.now().toUtc().toIso8601String(),
+       };
+ 
+diff --git a/lib/services/location_manager.dart b/lib/services/location_manager.dart
+--- a/lib/services/location_manager.dart
++++ b/lib/services/location_manager.dart
+@@ -195,9 +195,13 @@
+ 
+   // Manually request the current location (e.g., for a "Ping" button)
+   // This ALWAYS gets a fresh location, bypassing any throttling
+-  Future<void> grabLocationAndPing() async {
++  /// [precise] waits for a GPS-quality fix (needed by the Find screen),
++  /// since a coarse network fix is discarded by the 100 m send filter.
++  Future<void> grabLocationAndPing({bool precise = false}) async {
+     try {
+-      final currentPos = await _locationService.getCurrentPosition();
++      final currentPos = precise
++          ? await _locationService.getPreciseCurrentPosition()
++          : await _locationService.getCurrentPosition();
+       
+       // Always update position and timestamp for manual requests
+       _lastPosition = currentPos;
+diff --git a/lib/services/location/location_service.dart b/lib/services/location/location_service.dart
+--- a/lib/services/location/location_service.dart
++++ b/lib/services/location/location_service.dart
+@@ -19,6 +19,9 @@
+   /// Get the current position immediately.
+   Future<LocationUpdate> getCurrentPosition();
+ 
++  /// A fresh fix within [maxAccuracyMeters], waiting for GPS if needed.
++  Future<LocationUpdate> getPreciseCurrentPosition({double maxAccuracyMeters = 50});
++
+   /// Cached last known position without waiting for a new fix, or null.
+   Future<LocationUpdate?> getLastKnownPosition();
+ 
+diff --git a/lib/services/location/libre_location_service.dart b/lib/services/location/libre_location_service.dart
+--- a/lib/services/location/libre_location_service.dart
++++ b/lib/services/location/libre_location_service.dart
+@@ -204,6 +204,26 @@
+   }
+ 
+   @override
++  Future<LocationUpdate> getPreciseCurrentPosition({double maxAccuracyMeters = 50}) async {
++    // GPS can need a few attempts indoors; keep the best fix seen.
++    LocationUpdate? best;
++    for (var attempt = 0; attempt < 3; attempt++) {
++      final position = await libre.LibreLocation.getCurrentPosition(
++        accuracy: libre.Accuracy.high,
++        samples: 1,
++        timeout: 20,
++        maximumAge: 0,
++        persist: false,
++      );
++      final update = _mapPositionToLocationUpdate(position);
++      if (best == null || update.accuracy < best.accuracy) best = update;
++      if (update.accuracy <= maxAccuracyMeters) break;
++    }
++    print("Precise location ping: accuracy ${best!.accuracy.toStringAsFixed(0)} m");
++    return best;
++  }
++
++  @override
+   Future<LocationUpdate?> getLastKnownPosition() async {
+     try {
+       // maximumAge is in milliseconds; a cached fix of any recent age returns
+diff --git a/lib/widgets/contact_profile_modal.dart b/lib/widgets/contact_profile_modal.dart
+--- a/lib/widgets/contact_profile_modal.dart
++++ b/lib/widgets/contact_profile_modal.dart
+@@ -1,3 +1,4 @@
++import 'package:grid_frontend/services/find_device/device_commands.dart';
+ import 'dart:async';
+ import 'dart:io' show Platform;
+ 
+@@ -7,6 +8,8 @@
+ import 'package:grid_frontend/models/contact_display.dart';
+ import 'package:grid_frontend/providers/user_location_provider.dart';
+ import 'package:grid_frontend/services/in_app_notifier.dart';
++import 'package:matrix/matrix.dart' show Membership, Room;
++import 'package:grid_frontend/screens/find_device/find_device_screen.dart';
+ import 'package:grid_frontend/services/user_device_status_cache.dart';
+ import 'package:grid_frontend/utilities/time_ago_formatter.dart';
+ import 'package:grid_frontend/blocs/contacts/contacts_bloc.dart';
+@@ -95,6 +98,10 @@
+ 
+   // Relationship snapshot, computed once on modal open.
+   bool _hasDirect = false;
++  bool _ringing = false;
++  bool _ringConfirmed = false;
++  DateTime? _ringRequestedAt;
++  bool _sendingRing = false;
+   bool _directPending = false;
+   List<_SharedGroupRef> _sharedGroups = const [];
+   bool _sendingFriendRequest = false;
+@@ -106,14 +113,45 @@
+     _loadDeviceKeys();
+     _computeRelationship();
+     _subscribeToContacts();
++    DeviceCommands.ringStatus.addListener(_onRingStatus);
+   }
+ 
+   @override
+   void dispose() {
++    DeviceCommands.ringStatus.removeListener(_onRingStatus);
+     _contactsSub?.cancel();
+     super.dispose();
+   }
+ 
++  /// Reflects the ringing phone's acknowledgements (like Samsung Find's ring
++  /// state): confirms ringing, and resets the button once it was found or
++  /// timed out.
++  void _onRingStatus() {
++    final status = DeviceCommands.ringStatus.value[widget.contact.userId];
++    final requestedAt = _ringRequestedAt;
++    if (!mounted || status == null || requestedAt == null) return;
++    if (status.at.isBefore(requestedAt.subtract(const Duration(seconds: 5)))) return;
++    final name = widget.contact.displayName;
++    if (status.state == 'ringing') {
++      setState(() => _ringConfirmed = true);
++      return;
++    }
++    setState(() {
++      _ringing = false;
++      _ringConfirmed = false;
++      _ringRequestedAt = null;
++    });
++    InAppNotifier.instance.show(
++      title: status.state == 'found' ? '$name found their phone' : 'Stopped ringing',
++      message: status.state == 'found'
++          ? 'They tapped "Found it" on the ringing phone.'
++          : 'The phone rang for 2 minutes and stopped.',
++      variant: status.state == 'found'
++          ? InAppNotificationVariant.success
++          : InAppNotificationVariant.info,
++    );
++  }
++
+   void _computeRelationship() {
+     final myId = widget.roomService.getMyUserId();
+     final targetId = widget.contact.userId;
+@@ -1182,10 +1220,84 @@
+         Expanded(
+           child: _buildSharingActionTile(),
+         ),
++        const SizedBox(width: 10),
++        Expanded(
++          child: _ActionTile(
++            icon: _ringing
++                ? Icons.volume_off_rounded
++                : Icons.notifications_active_rounded,
++            label: _ringing ? 'Stop sound' : 'Play sound',
++            subtext: _ringing ? (_ringConfirmed ? 'Ringing' : 'Sending…') : null,
++            onTap: _hasDirect && !_directPending && !_sendingRing
++                ? _toggleRing
++                : null,
++          ),
++        ),
++        const SizedBox(width: 10),
++        Expanded(
++          child: _ActionTile(
++            icon: Icons.explore_rounded,
++            label: 'Find',
++            onTap: _hasDirect && !_directPending ? _openFindScreen : null,
++          ),
++        ),
+       ],
+     );
+   }
+ 
++  Room? _directRoom() {
++    final myUserId = widget.roomService.getMyUserId();
++    return widget.roomService.client.rooms.where((r) =>
++        r.membership == Membership.join &&
++        (r.name == 'Grid:Direct:$myUserId:${widget.contact.userId}' ||
++            r.name == 'Grid:Direct:${widget.contact.userId}:$myUserId')).firstOrNull;
++  }
++
++  void _openFindScreen() {
++    final room = _directRoom();
++    if (room == null) return;
++    Navigator.of(context).push(MaterialPageRoute(
++      builder: (_) => FindDeviceScreen(
++        room: room,
++        userId: widget.contact.userId,
++        displayName: widget.contact.displayName,
++      ),
++    ));
++  }
++
++  /// Rings the contact's phone at full alarm volume, like Samsung Find's
++  /// "Ring" — delivered by push even when their app is closed.
++  Future<void> _toggleRing() async {
++    final room = _directRoom();
++    if (room == null) return;
++    final start = !_ringing;
++    setState(() => _sendingRing = true);
++    try {
++      await DeviceCommands.sendRing(room, start: start);
++      if (!mounted) return;
++      setState(() {
++        _ringing = start;
++        _ringConfirmed = false;
++        _ringRequestedAt = start ? DateTime.now() : null;
++      });
++      InAppNotifier.instance.show(
++        title: start ? 'Ringing ${widget.contact.displayName}' : 'Stopped ringing',
++        message: start
++            ? 'Their phone plays a loud sound for up to 2 minutes.'
++            : 'Their phone will stop ringing.',
++        variant: InAppNotificationVariant.info,
++      );
++    } catch (e) {
++      InAppNotifier.instance.show(
++        title: 'Could not ring',
++        message: '$e',
++        variant: InAppNotificationVariant.error,
++      );
++    } finally {
++      if (mounted) setState(() => _sendingRing = false);
++    }
++  }
++
+   Widget _buildSharingActionTile() {
+     final managedInGroup = _relationship == _RelationshipState.groupOnly ||
+         _directPending;
+diff --git a/android/app/src/main/kotlin/app/mygrid/grid/MainActivity.kt b/android/app/src/main/kotlin/app/mygrid/grid/MainActivity.kt
+--- a/android/app/src/main/kotlin/app/mygrid/grid/MainActivity.kt
++++ b/android/app/src/main/kotlin/app/mygrid/grid/MainActivity.kt
+@@ -1,5 +1,7 @@
+ package app.mygrid.grid
+ 
++import app.mygrid.grid.finddevice.AppVisibility
++import app.mygrid.grid.finddevice.FindDevicePlugin
+ import io.flutter.embedding.android.FlutterActivity
+ import io.flutter.embedding.engine.FlutterEngine
+ import io.flutter.plugin.common.MethodChannel
+@@ -8,8 +10,19 @@
+     // Must match AppLifecycleChannel.channelName on the Dart side.
+     private val lifecycleChannel = "app.mygrid.grid/lifecycle"
+ 
++    override fun onStart() {
++        super.onStart()
++        AppVisibility.isForeground = true
++    }
++
++    override fun onStop() {
++        AppVisibility.isForeground = false
++        super.onStop()
++    }
++
+     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+         super.configureFlutterEngine(flutterEngine)
++        flutterEngine.plugins.add(FindDevicePlugin(isMainEngine = true))
+         MethodChannel(
+             flutterEngine.dartExecutor.binaryMessenger,
+             lifecycleChannel,
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -2,7 +2,11 @@
+     xmlns:tools="http://schemas.android.com/tools">
+ 
+     <uses-permission android:name="android.permission.INTERNET" />
+-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
++    <!-- ble_proximity_signal declares this with maxSdkVersion=30 (BLE scans on
++         old Android); without tools:remove the merge drops precise location on
++         Android 12+, so GPS fixes are never precise. -->
++    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
++        tools:remove="android:maxSdkVersion" />
+     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+@@ -77,8 +81,31 @@
+             android:exported="false"
+             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"/>
+ 
++        <!-- Find device: UnifiedPush receiver (replaces the Flutter plugin's
++             service so every push reaches one dedicated handler engine) -->
++        <service
++            android:name="org.unifiedpush.flutter.connector.UnifiedPushService"
++            tools:node="remove" />
++        <service
++            android:name=".finddevice.GridPushService"
++            android:exported="false">
++            <intent-filter>
++                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
++            </intent-filter>
++        </service>
++        <receiver
++            android:name=".finddevice.DeviceAlarm$StopReceiver"
++            android:exported="false" />
+     </application>
+ 
++    <!-- Find device alarm -->
++    <uses-permission android:name="android.permission.VIBRATE" />
++    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
++    <!-- Find nearby (Bluetooth) on Android 11 and older; ble_proximity_signal
++         only declares the Android 12+ permissions. -->
++    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
++    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
++
+     <!-- Required to query activities that can process text -->
+     <queries>
+         <intent>
+diff --git a/android/app/src/main/kotlin/app/mygrid/grid/finddevice/DeviceAlarm.kt b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/DeviceAlarm.kt
+new file mode 100644
+index 0000000..3556c3d
+--- /dev/null
++++ b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/DeviceAlarm.kt
+@@ -0,0 +1,199 @@
++package app.mygrid.grid.finddevice
++
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.media.AudioAttributes
++import android.media.AudioManager
++import android.media.MediaPlayer
++import android.media.RingtoneManager
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.os.PowerManager
++import android.os.VibrationEffect
++import android.os.Vibrator
++import android.os.VibratorManager
++import android.util.Log
++import android.app.Notification
++
++/**
++ * Loud "find my phone" alarm, modeled on Samsung Find's ring operation:
++ * plays the alarm tone on the alarm stream at maximum volume (audible in
++ * silent/vibrate mode), vibrates, and shows a notification to stop it.
++ * The previous alarm volume is restored when it stops.
++ */
++object DeviceAlarm {
++    private const val TAG = "FindDeviceAlarm"
++    private const val CHANNEL_ID = "find_device_alarm"
++    private const val NOTIFICATION_ID = 0x46494e44 // "FIND"
++    private const val MAX_DURATION_MS = 2 * 60 * 1000L
++    const val ACTION_STOP = "app.familyfinder.gridpilot.STOP_FIND_ALARM"
++
++    private val handler = Handler(Looper.getMainLooper())
++    private var player: MediaPlayer? = null
++    private var vibrator: Vibrator? = null
++    private var wakeLock: PowerManager.WakeLock? = null
++    private var savedVolume: Int? = null
++    private var lastRequestId: String? = null
++    private var requestRoomId: String? = null
++    private val autoStop = Runnable { appContext?.let { stop(it, REASON_TIMEOUT) } }
++    private var appContext: Context? = null
++
++    val isRinging: Boolean get() = player != null
++
++    const val REASON_FOUND = "found"
++    const val REASON_TIMEOUT = "timeout"
++    const val REASON_REMOTE = "remote"
++
++    /**
++     * Starts ringing. Returns true only when this call started the alarm, so
++     * exactly one caller acknowledges it; repeats of a request are ignored.
++     */
++    @Synchronized
++    fun start(context: Context, requestId: String, roomId: String, requester: String): Boolean {
++        val ctx = context.applicationContext
++        appContext = ctx
++        if (requestId == lastRequestId) return false
++        lastRequestId = requestId
++        requestRoomId = roomId
++        if (isRinging) {
++            restartTimeout()
++            return true
++        }
++        Log.d(TAG, "Ringing for request $requestId")
++
++        val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
++        savedVolume = audio.getStreamVolume(AudioManager.STREAM_ALARM)
++        try {
++            audio.setStreamVolume(
++                AudioManager.STREAM_ALARM,
++                audio.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0
++            )
++        } catch (e: SecurityException) {
++            Log.w(TAG, "Could not raise alarm volume: ${e.message}")
++        }
++
++        val tone = RingtoneManager.getActualDefaultRingtoneUri(ctx, RingtoneManager.TYPE_ALARM)
++            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
++        player = MediaPlayer().apply {
++            setAudioAttributes(
++                AudioAttributes.Builder()
++                    .setUsage(AudioAttributes.USAGE_ALARM)
++                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
++                    .build()
++            )
++            setDataSource(ctx, tone)
++            isLooping = true
++            prepare()
++            start()
++        }
++
++        vibrator = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++            (ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
++        } else {
++            @Suppress("DEPRECATION")
++            ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
++        }).also {
++            val pattern = longArrayOf(0, 800, 400)
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                it.vibrate(VibrationEffect.createWaveform(pattern, 0))
++            } else {
++                @Suppress("DEPRECATION")
++                it.vibrate(pattern, 0)
++            }
++        }
++
++        wakeLock = (ctx.getSystemService(Context.POWER_SERVICE) as PowerManager)
++            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gridpilot:find-alarm")
++            .also { it.acquire(MAX_DURATION_MS + 5_000) }
++
++        showNotification(ctx, requester)
++        restartTimeout()
++        return true
++    }
++
++    /** Stops ringing and reports [reason] to the requester via the push handler. */
++    @Synchronized
++    fun stop(context: Context, reason: String) {
++        val ctx = context.applicationContext
++        val wasRinging = isRinging
++        handler.removeCallbacks(autoStop)
++        player?.run {
++            try { stop() } catch (_: IllegalStateException) {}
++            release()
++        }
++        player = null
++        vibrator?.cancel()
++        vibrator = null
++        savedVolume?.let {
++            val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
++            try { audio.setStreamVolume(AudioManager.STREAM_ALARM, it, 0) } catch (_: SecurityException) {}
++        }
++        savedVolume = null
++        wakeLock?.let { if (it.isHeld) it.release() }
++        wakeLock = null
++        (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
++            .cancel(NOTIFICATION_ID)
++        Log.d(TAG, "Alarm stopped ($reason)")
++        val roomId = requestRoomId
++        val requestId = lastRequestId
++        if (wasRinging && roomId != null && requestId != null && reason != REASON_REMOTE) {
++            PushDispatcher.reportAlarmStopped(ctx, roomId, requestId, reason)
++        }
++    }
++
++    private fun restartTimeout() {
++        handler.removeCallbacks(autoStop)
++        handler.postDelayed(autoStop, MAX_DURATION_MS)
++    }
++
++    private fun showNotification(ctx: Context, requester: String) {
++        val manager = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
++            manager.getNotificationChannel(CHANNEL_ID) == null) {
++            manager.createNotificationChannel(
++                NotificationChannel(CHANNEL_ID, "Find this phone", NotificationManager.IMPORTANCE_HIGH).apply {
++                    description = "Shown while a family member is ringing this phone"
++                    setSound(null, null) // the alarm itself provides the sound
++                    enableVibration(false)
++                }
++            )
++        }
++        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++        val stop = PendingIntent.getBroadcast(
++            ctx, 0, Intent(ctx, StopReceiver::class.java).setAction(ACTION_STOP), flags
++        )
++        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            Notification.Builder(ctx, CHANNEL_ID)
++        } else {
++            @Suppress("DEPRECATION")
++            Notification.Builder(ctx).setPriority(Notification.PRIORITY_MAX)
++        }
++        val notification = builder
++            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
++            .setContentTitle("Ringing this phone")
++            .setContentText("$requester is trying to find this phone. Tap to stop.")
++            .setCategory(Notification.CATEGORY_ALARM)
++            .setVisibility(Notification.VISIBILITY_PUBLIC)
++            .setOngoing(true)
++            .setContentIntent(stop)
++            .addAction(Notification.Action.Builder(null, "Found it", stop).build())
++            .setDeleteIntent(stop)
++            .build()
++        try {
++            manager.notify(NOTIFICATION_ID, notification)
++        } catch (e: SecurityException) {
++            Log.w(TAG, "Notification permission missing; alarm still rings: ${e.message}")
++        }
++    }
++
++    class StopReceiver : BroadcastReceiver() {
++        override fun onReceive(context: Context, intent: Intent?) {
++            if (intent?.action == ACTION_STOP) stop(context, REASON_FOUND)
++        }
++    }
++}
+diff --git a/android/app/src/main/kotlin/app/mygrid/grid/finddevice/FindDevicePlugin.kt b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/FindDevicePlugin.kt
+new file mode 100644
+index 0000000..f20450d
+--- /dev/null
++++ b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/FindDevicePlugin.kt
+@@ -0,0 +1,93 @@
++package app.mygrid.grid.finddevice
++
++import android.content.Context
++import io.flutter.embedding.engine.plugins.FlutterPlugin
++import io.flutter.plugin.common.MethodCall
++import io.flutter.plugin.common.MethodChannel
++import org.unifiedpush.android.connector.UnifiedPush
++
++/**
++ * Platform side of lib/services/find_device/find_device_channel.dart:
++ * push registration via the installed UnifiedPush distributor, and the
++ * ring alarm. Registered on the UI engine and the push handler engine.
++ */
++/**
++ * [isMainEngine] marks the app's UI engine. When its Dart side is listening,
++ * pushes are handled there with the app's own Matrix client; a second client
++ * sending from the same device desynchronizes encryption sessions.
++ */
++class FindDevicePlugin(private val isMainEngine: Boolean = false) :
++    FlutterPlugin, MethodChannel.MethodCallHandler {
++    private var context: Context? = null
++    private var channel: MethodChannel? = null
++
++    override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
++        context = binding.applicationContext
++        channel = MethodChannel(binding.binaryMessenger, CHANNEL).also {
++            it.setMethodCallHandler(this)
++        }
++    }
++
++    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
++        if (isMainEngine) PushDispatcher.setMainEngine(null)
++        channel?.setMethodCallHandler(null)
++        channel = null
++        context = null
++    }
++
++    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
++        val ctx = context ?: return result.error("NO_CONTEXT", null, null)
++        when (call.method) {
++            "registerPush" -> result.success(registerPush(ctx))
++            "pushStatus" -> {
++                val prefs = GridPushService.prefs(ctx)
++                result.success(mapOf(
++                    "endpoint" to prefs.getString(GridPushService.KEY_ENDPOINT, null),
++                    "failure" to prefs.getString(GridPushService.KEY_FAILURE, null),
++                    "distributor" to UnifiedPush.getAckDistributor(ctx),
++                ))
++            }
++            "startAlarm" -> result.success(
++                DeviceAlarm.start(
++                    ctx,
++                    call.argument<String>("requestId") ?: "",
++                    call.argument<String>("roomId") ?: "",
++                    call.argument<String>("requester") ?: "A family member",
++                )
++            )
++            "stopAlarm" -> {
++                DeviceAlarm.stop(ctx, DeviceAlarm.REASON_REMOTE)
++                result.success(true)
++            }
++            "isAlarmRinging" -> result.success(DeviceAlarm.isRinging)
++            "pushReady" -> {
++                if (isMainEngine) PushDispatcher.setMainEngine(channel)
++                else PushDispatcher.onDartReady()
++                result.success(true)
++            }
++            else -> result.notImplemented()
++        }
++    }
++
++    /** Picks a distributor (preferring ntfy) and registers; the endpoint arrives in [GridPushService]. */
++    private fun registerPush(ctx: Context): String? {
++        val distributors = UnifiedPush.getDistributors(ctx)
++        val current = UnifiedPush.getAckDistributor(ctx) ?: UnifiedPush.getSavedDistributor(ctx)
++        val chosen = current?.takeIf { it in distributors }
++            ?: distributors.firstOrNull { it == NTFY } ?: distributors.firstOrNull()
++            ?: return null
++        UnifiedPush.saveDistributor(ctx, chosen)
++        UnifiedPush.register(ctx)
++        return chosen
++    }
++
++    companion object {
++        const val CHANNEL = "app.familyfinder/find_device"
++        private const val NTFY = "io.heckel.ntfy"
++    }
++}
++
++/** Whether MainActivity (the only activity) is visible, for the push handler. */
++object AppVisibility {
++    @Volatile var isForeground = false
++}
+diff --git a/android/app/src/main/kotlin/app/mygrid/grid/finddevice/GridPushService.kt b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/GridPushService.kt
+new file mode 100644
+index 0000000..507cd21
+--- /dev/null
++++ b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/GridPushService.kt
+@@ -0,0 +1,49 @@
++package app.mygrid.grid.finddevice
++
++import android.content.Context
++import android.util.Log
++import org.unifiedpush.android.connector.FailedReason
++import org.unifiedpush.android.connector.PushService
++import org.unifiedpush.android.connector.data.PushEndpoint
++import org.unifiedpush.android.connector.data.PushMessage
++
++/**
++ * Receives UnifiedPush events from the distributor (ntfy). Replaces the
++ * unifiedpush_android Flutter service, whose shared call queue is only drained
++ * by the most recently initialized engine and drops messages once that engine
++ * goes away. Here every message goes to [PushDispatcher]'s dedicated engine.
++ */
++class GridPushService : PushService() {
++    override fun onNewEndpoint(endpoint: PushEndpoint, instance: String) {
++        Log.d(TAG, "New push endpoint registered")
++        prefs(this).edit()
++            .putString(KEY_ENDPOINT, endpoint.url)
++            .remove(KEY_FAILURE)
++            .apply()
++    }
++
++    override fun onMessage(message: PushMessage, instance: String) {
++        Log.d(TAG, "Push message received (${message.content.size} bytes)")
++        PushDispatcher.dispatch(this, String(message.content, Charsets.UTF_8))
++    }
++
++    override fun onRegistrationFailed(reason: FailedReason, instance: String) {
++        Log.w(TAG, "Push registration failed: $reason")
++        prefs(this).edit().putString(KEY_FAILURE, reason.name).apply()
++    }
++
++    override fun onUnregistered(instance: String) {
++        Log.w(TAG, "Push unregistered by distributor")
++        prefs(this).edit().remove(KEY_ENDPOINT).apply()
++    }
++
++    companion object {
++        private const val TAG = "GridPushService"
++        private const val PREFS = "find_device_push"
++        const val KEY_ENDPOINT = "endpoint"
++        const val KEY_FAILURE = "failure"
++
++        fun prefs(context: Context) =
++            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++    }
++}
+diff --git a/android/app/src/main/kotlin/app/mygrid/grid/finddevice/PushDispatcher.kt b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/PushDispatcher.kt
+new file mode 100644
+index 0000000..a262074
+--- /dev/null
++++ b/android/app/src/main/kotlin/app/mygrid/grid/finddevice/PushDispatcher.kt
+@@ -0,0 +1,108 @@
++package app.mygrid.grid.finddevice
++
++import android.content.Context
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++import io.flutter.FlutterInjector
++import io.flutter.embedding.engine.FlutterEngine
++import io.flutter.embedding.engine.dart.DartExecutor
++import io.flutter.plugin.common.MethodChannel
++
++/**
++ * Hands push payloads to a long-lived headless Flutter engine that runs
++ * `findDevicePushMain` (lib/services/find_device/push_background.dart).
++ * Payloads are queued until the Dart side reports ready, so a push that
++ * starts the process is not lost while the engine boots.
++ */
++object PushDispatcher {
++    private const val TAG = "FindDevicePush"
++    private const val ENTRYPOINT_LIBRARY =
++        "package:grid_frontend/services/find_device/push_background.dart"
++    private const val ENTRYPOINT = "findDevicePushMain"
++
++    private val main = Handler(Looper.getMainLooper())
++    private val pending = mutableListOf<String>()
++    private val pendingCalls = mutableListOf<Call>()
++    private var engine: FlutterEngine? = null
++    private var channel: MethodChannel? = null
++    private var ready = false
++    /** The UI engine's channel while its push handler is listening. */
++    private var mainEngine: MethodChannel? = null
++
++    fun setMainEngine(channel: MethodChannel?) {
++        main.post { mainEngine = channel }
++    }
++
++    fun dispatch(context: Context, payload: String) {
++        main.post {
++            val ui = mainEngine
++            when {
++                ui != null -> ui.invokeMethod("onPush", pushArgs(payload))
++                ready -> deliver(payload)
++                else -> {
++                    pending.add(payload)
++                    ensureEngine(context.applicationContext)
++                }
++            }
++        }
++    }
++
++    /** Called by the Dart entrypoint once its handler is registered. */
++    fun onDartReady() {
++        main.post {
++            ready = true
++            Log.d(TAG, "Push handler ready; delivering ${pending.size} queued")
++            pending.forEach { deliver(it) }
++            pending.clear()
++            pendingCalls.forEach { deliver(it) }
++            pendingCalls.clear()
++        }
++    }
++
++    /** Asks the push handler engine to tell the requester the alarm stopped. */
++    fun reportAlarmStopped(context: Context, roomId: String, requestId: String, reason: String) {
++        dispatchCall(context, Call("onAlarmStopped", mapOf(
++            "roomId" to roomId, "requestId" to requestId, "reason" to reason,
++        )))
++    }
++
++    private fun pushArgs(payload: String) = mapOf(
++        "payload" to payload,
++        "appInForeground" to AppVisibility.isForeground,
++    )
++
++    private fun deliver(payload: String) = deliver(Call("onPush", pushArgs(payload)))
++
++    private fun deliver(call: Call) {
++        channel?.invokeMethod(call.method, call.args)
++    }
++
++    private fun dispatchCall(context: Context, call: Call) {
++        main.post {
++            val ui = mainEngine
++            if (ui != null) ui.invokeMethod(call.method, call.args)
++            else if (ready) deliver(call) else {
++                pendingCalls.add(call)
++                ensureEngine(context.applicationContext)
++            }
++        }
++    }
++
++    private data class Call(val method: String, val args: Map<String, Any?>)
++
++    private fun ensureEngine(context: Context) {
++        if (engine != null) return
++        Log.d(TAG, "Starting push handler engine")
++        val loader = FlutterInjector.instance().flutterLoader()
++        loader.startInitialization(context)
++        loader.ensureInitializationComplete(context, null)
++        val newEngine = FlutterEngine(context)
++        newEngine.plugins.add(FindDevicePlugin())
++        channel = MethodChannel(newEngine.dartExecutor.binaryMessenger, FindDevicePlugin.CHANNEL)
++        engine = newEngine
++        newEngine.dartExecutor.executeDartEntrypoint(
++            DartExecutor.DartEntrypoint(loader.findAppBundlePath(), ENTRYPOINT_LIBRARY, ENTRYPOINT)
++        )
++    }
++}
+diff --git a/lib/screens/find_device/find_device_screen.dart b/lib/screens/find_device/find_device_screen.dart
+new file mode 100644
+index 0000000..eeecd88
+--- /dev/null
++++ b/lib/screens/find_device/find_device_screen.dart
+@@ -0,0 +1,234 @@
++import 'dart:async';
++import 'dart:math' as math;
++
++import 'package:ble_proximity_signal/ble_proximity_signal.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_compass/flutter_compass.dart';
++import 'package:latlong2/latlong.dart';
++import 'package:matrix/matrix.dart';
++import 'package:provider/provider.dart';
++
++import '../../providers/user_location_provider.dart';
++import '../../services/avatar_announcement_service.dart';
++import '../../services/find_device/device_commands.dart';
++import '../../services/location_manager.dart';
++
++/// Points the way to a contact's phone, like Samsung Find / Find My:
++/// an arrow and distance from GPS + compass while far away, then Bluetooth
++/// signal strength ("Search nearby") and a loud ring for the last metres.
++/// While open, the contact's phone is asked for its location every
++/// [_refresh] and to broadcast a one-time Bluetooth token.
++class FindDeviceScreen extends StatefulWidget {
++  final Room room;
++  final String userId;
++  final String displayName;
++
++  const FindDeviceScreen({
++    super.key,
++    required this.room,
++    required this.userId,
++    required this.displayName,
++  });
++
++  @override
++  State<FindDeviceScreen> createState() => _FindDeviceScreenState();
++}
++
++class _FindDeviceScreenState extends State<FindDeviceScreen> {
++  static const _refresh = Duration(seconds: 10);
++  /// Below this, GPS error dominates and the arrow is unreliable.
++  static const _closeRangeMeters = 20.0;
++
++  final _ble = BleProximitySignal();
++  final _token = _randomToken();
++  Timer? _requestTimer;
++  StreamSubscription<CompassEvent>? _compassSub;
++  StreamSubscription<ProximityEvent>? _proximitySub;
++  double? _heading;
++  ProximityEvent? _proximity;
++  String? _bluetoothProblem;
++  bool _ringing = false;
++
++  @override
++  void initState() {
++    super.initState();
++    _compassSub = FlutterCompass.events?.listen((e) {
++      if (mounted) setState(() => _heading = e.heading);
++    });
++    _requestLocation();
++    _requestTimer = Timer.periodic(_refresh, (_) => _requestLocation());
++    _startNearby();
++  }
++
++  @override
++  void dispose() {
++    _requestTimer?.cancel();
++    _compassSub?.cancel();
++    _proximitySub?.cancel();
++    unawaited(_ble.stopScan().catchError((_) {}));
++    unawaited(DeviceCommands.sendNearby(widget.room, token: _token, start: false)
++        .catchError((_) {}));
++    super.dispose();
++  }
++
++  void _requestLocation() {
++    unawaited(AvatarAnnouncementService(widget.room.client)
++        .requestLocations(widget.room.id, userIds: [widget.userId], live: true));
++  }
++
++  Future<void> _startNearby() async {
++    try {
++      if (await _ble.requestPermissions() != BlePermissionStatus.granted) {
++        setState(() => _bluetoothProblem = 'Allow "Nearby devices" to use the signal meter');
++        return;
++      }
++      if (await _ble.checkAvailability() != BleAvailability.ready) {
++        setState(() => _bluetoothProblem = 'Turn on Bluetooth to use the signal meter');
++        return;
++      }
++      _proximitySub = _ble.events.listen((e) {
++        if (mounted) setState(() => _proximity = e);
++      });
++      await _ble.startScan(
++        targetTokens: [_token],
++        config: const ScanConfig(serviceUuid: DeviceCommands.nearbyServiceUuid),
++      );
++      await DeviceCommands.sendNearby(widget.room, token: _token, start: true);
++    } catch (e) {
++      print('[FindDevice] Nearby scan failed: $e');
++      if (mounted) setState(() => _bluetoothProblem = 'Signal meter unavailable');
++    }
++  }
++
++  Future<void> _toggleRing() async {
++    final start = !_ringing;
++    setState(() => _ringing = start);
++    await DeviceCommands.sendRing(widget.room, start: start);
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final mine = context.watch<LocationManager>().currentLatLng;
++    final theirs = context.watch<UserLocationProvider>().getUserLocation(widget.userId);
++    final target = theirs == null ? null : LatLng(theirs.latitude, theirs.longitude);
++    final updated = theirs == null ? null : DateTime.tryParse(theirs.timestamp);
++    final colors = Theme.of(context).colorScheme;
++
++    double? meters;
++    double? bearing;
++    if (mine != null && target != null) {
++      meters = const Distance().as(LengthUnit.Meter, mine, target);
++      bearing = const Distance().bearing(mine, target);
++    }
++    final close = meters != null && meters < _closeRangeMeters;
++
++    return Scaffold(
++      appBar: AppBar(title: Text('Find ${widget.displayName}')),
++      body: SafeArea(
++        child: Padding(
++          padding: const EdgeInsets.all(24),
++          child: Column(
++            children: [
++              const Spacer(),
++              _buildArrow(colors, bearing, close),
++              const SizedBox(height: 24),
++              Text(
++                meters == null
++                    ? 'Waiting for location…'
++                    : close
++                        ? 'Very close'
++                        : _formatDistance(meters),
++                style: Theme.of(context).textTheme.displaySmall,
++              ),
++              const SizedBox(height: 8),
++              Text(
++                _statusLine(close, updated),
++                textAlign: TextAlign.center,
++                style: TextStyle(color: colors.onSurfaceVariant),
++              ),
++              const Spacer(),
++              _buildSignal(colors),
++              const SizedBox(height: 24),
++              SizedBox(
++                width: double.infinity,
++                child: FilledButton.icon(
++                  onPressed: _toggleRing,
++                  icon: Icon(_ringing
++                      ? Icons.volume_off_rounded
++                      : Icons.notifications_active_rounded),
++                  label: Text(_ringing ? 'Stop sound' : 'Play sound'),
++                ),
++              ),
++            ],
++          ),
++        ),
++      ),
++    );
++  }
++
++  String _statusLine(bool close, DateTime? updated) {
++    if (_heading == null && !close) return 'Compass unavailable — the arrow is relative to north';
++    final age = updated == null ? null : DateTime.now().difference(updated);
++    final when = age == null
++        ? ''
++        : age.inSeconds < 60
++            ? 'Updated ${age.inSeconds}s ago'
++            : 'Updated ${age.inMinutes} min ago';
++    return close ? 'Use the signal below or play a sound. $when' : 'Hold your phone flat. $when';
++  }
++
++  Widget _buildArrow(ColorScheme colors, double? bearing, bool close) {
++    if (bearing == null || close) {
++      return Icon(Icons.my_location_rounded, size: 160, color: colors.primary);
++    }
++    // Arrow points at the target relative to where the phone is facing.
++    final angle = (bearing - (_heading ?? 0)) * math.pi / 180;
++    return Transform.rotate(
++      angle: angle,
++      child: Icon(Icons.navigation_rounded, size: 200, color: colors.primary),
++    );
++  }
++
++  Widget _buildSignal(ColorScheme colors) {
++    final p = _proximity;
++    final stale = p == null || DateTime.now().difference(p.timestamp) > const Duration(seconds: 8);
++    final label = _bluetoothProblem ??
++        (stale
++            ? 'Searching for their phone nearby…'
++            : switch (p.level) {
++                ProximityLevel.veryNear => 'Very near — within a few metres',
++                ProximityLevel.near => 'Near — getting warmer',
++                ProximityLevel.far => 'In range — keep moving',
++              });
++    return Column(
++      children: [
++        Row(
++          children: [
++            Icon(Icons.bluetooth_searching_rounded, color: colors.primary),
++            const SizedBox(width: 8),
++            Expanded(child: Text(label)),
++          ],
++        ),
++        const SizedBox(height: 8),
++        ClipRRect(
++          borderRadius: BorderRadius.circular(8),
++          child: LinearProgressIndicator(
++            value: stale ? 0 : p.intensity.clamp(0.0, 1.0),
++            minHeight: 12,
++            color: colors.primary,
++            backgroundColor: colors.surfaceContainerHighest,
++          ),
++        ),
++      ],
++    );
++  }
++
++  static String _formatDistance(double meters) => meters < 1000
++      ? '${meters.round()} m'
++      : '${(meters / 1000).toStringAsFixed(meters < 10000 ? 1 : 0)} km';
++
++  static String _randomToken() {
++    final random = math.Random.secure();
++    return List.generate(8, (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
++  }
++}
+diff --git a/lib/services/find_device/device_commands.dart b/lib/services/find_device/device_commands.dart
+new file mode 100644
+index 0000000..e2983c7
+--- /dev/null
++++ b/lib/services/find_device/device_commands.dart
+@@ -0,0 +1,179 @@
++import 'dart:async';
++
++import 'package:ble_proximity_signal/ble_proximity_signal.dart';
++import 'package:flutter/foundation.dart';
++import 'package:matrix/matrix.dart';
++
++import 'find_device_channel.dart';
++
++/// Find-device commands, sent as (end-to-end encrypted) messages in the
++/// direct room shared by two contacts — the Matrix counterpart of Samsung
++/// Find's `/devices/{id}/operation/{type}` calls. Room membership is the
++/// authorization: only a contact you share a direct room with can ring you.
++class DeviceCommands {
++  static const ringMsgtype = 'm.device.ring';
++  static const ringStatusMsgtype = 'm.device.ring.status';
++
++  /// Asks the phone to broadcast a one-time Bluetooth token so the finder can
++  /// measure proximity (Samsung Find's "Search nearby" on non-UWB phones).
++  static const nearbyMsgtype = 'm.device.nearby';
++  static const maxBroadcast = Duration(minutes: 5);
++  static final _ble = BleProximitySignal();
++
++  /// 16-bit-form service UUID (Bluetooth base UUID). The plugin's default
++  /// 128-bit UUID plus service data is 47 bytes, over the 31-byte legacy
++  /// advertisement limit, so advertising failed with DATA_TOO_LARGE.
++  static const nearbyServiceUuid = '0000ffe7-0000-1000-8000-00805f9b34fb';
++  static Timer? _broadcastTimeout;
++
++  /// Latest ring status reported by each contact's phone, for the finder UI.
++  static final ringStatus = ValueNotifier<Map<String, RingStatus>>({});
++
++  /// Commands older than this are ignored, so a phone that comes back online
++  /// does not ring for a request made long ago.
++  static const maxCommandAge = Duration(minutes: 2);
++
++  static Future<void> sendNearby(Room room, {required String token, required bool start}) async {
++    await room.sendEvent({
++      'msgtype': nearbyMsgtype,
++      'body': start ? 'Finding your phone nearby' : 'Stopped nearby search',
++      'action': start ? 'start' : 'stop',
++      'token': token,
++    });
++  }
++
++  static Future<void> sendRing(Room room, {required bool start}) async {
++    await room.sendEvent({
++      'msgtype': ringMsgtype,
++      'body': start ? 'Ringing your phone' : 'Stopped ringing',
++      'action': start ? 'start' : 'stop',
++    });
++  }
++
++  /// Acts on a decrypted ring command. Returns true when it was a ring command.
++  static Future<bool> handle(Event event, Room room, String? myUserId) async {
++    final msgtype = event.content['msgtype'];
++    if (msgtype != ringMsgtype && msgtype != nearbyMsgtype) return false;
++    if (event.senderId == myUserId) return true;
++    if (DateTime.now().difference(event.originServerTs) > maxCommandAge) {
++      print('[FindDevice] Ignoring stale ring command ${event.eventId}');
++      return true;
++    }
++    if (!await _isDirectContact(room, event.senderId, myUserId)) {
++      print('[FindDevice] Ignoring ring from non-contact ${event.senderId}');
++      return true;
++    }
++    if (msgtype == nearbyMsgtype) {
++      await _handleNearby(event);
++    } else if (event.content['action'] == 'stop') {
++      await FindDeviceChannel.stopAlarm();
++    } else {
++      final sender = room.unsafeGetUserFromMemoryOrFallback(event.senderId);
++      final started = await FindDeviceChannel.startAlarm(
++        requestId: event.eventId,
++        roomId: room.id,
++        requester: sender.calcDisplayname(),
++      );
++      if (started) await sendStatus(room, event.eventId, 'ringing');
++    }
++    return true;
++  }
++
++  static StreamSubscription<ProximityEvent>? _broadcastErrors;
++
++  static Future<void> _handleNearby(Event event) async {
++    // Advertising failures are only reported on the events stream.
++    _broadcastErrors ??= _ble.events.listen((_) {}, onError: (Object e) {
++      print('[FindDevice] Nearby broadcast error: $e');
++    });
++    _broadcastTimeout?.cancel();
++    try {
++      await _ble.stopBroadcast();
++    } catch (_) {}
++    final token = event.content['token'];
++    if (event.content['action'] != 'start' || token is! String) return;
++    try {
++      if (await _ble.checkPermissions() != BlePermissionStatus.granted) {
++        print('[FindDevice] Nearby: Bluetooth permission not granted');
++        return;
++      }
++      await _ble.startBroadcast(
++        token: token,
++        config: const BroadcastConfig(
++            serviceUuid: nearbyServiceUuid, txPower: 3 /* high, for range */),
++      );
++      _broadcastTimeout = Timer(maxBroadcast, () => _ble.stopBroadcast());
++      print('[FindDevice] Broadcasting nearby token');
++    } catch (e) {
++      print('[FindDevice] Nearby broadcast failed: $e');
++    }
++  }
++
++  /// Bluetooth permission is needed in advance: a lost phone cannot show a
++  /// permission prompt. Asked once when the app opens.
++  static Future<void> ensureNearbyPermission() async {
++    try {
++      if (await _ble.checkPermissions() != BlePermissionStatus.granted) {
++        await _ble.requestPermissions();
++      }
++    } catch (e) {
++      print('[FindDevice] Bluetooth permission request failed: $e');
++    }
++  }
++
++  /// Tells the requester whether the phone is ringing or why it stopped
++  /// (`found`, `timeout`) — like Samsung Find's ring state.
++  static Future<void> sendStatus(Room room, String requestId, String state) async {
++    try {
++      await room.sendEvent({
++        'msgtype': ringStatusMsgtype,
++        'body': 'Ring status: $state',
++        'state': state,
++        'request_id': requestId,
++      });
++    } catch (e) {
++      print('[FindDevice] Could not send ring status: $e');
++    }
++  }
++
++  /// Finder side: records a contact's reported ring status.
++  static void handleStatus(Event event) {
++    if (event.content['msgtype'] != ringStatusMsgtype) return;
++    if (DateTime.now().difference(event.originServerTs) > maxCommandAge * 2) return;
++    final state = event.content['state'];
++    if (state is! String) return;
++    ringStatus.value = {
++      ...ringStatus.value,
++      event.senderId: RingStatus(state, event.originServerTs),
++    };
++  }
++
++  /// Server-authoritative check that [sender] and [me] are both joined to a
++  /// Grid direct room; a background engine's cached room state may be stale.
++  static Future<bool> _isDirectContact(Room room, String sender, String? me) async {
++    if (me == null) return false;
++    final client = room.client;
++    try {
++      final nameState =
++          await client.getRoomStateWithKey(room.id, EventTypes.RoomName, '');
++      final name = nameState['name'];
++      if (name is! String || !name.startsWith('Grid:Direct:')) return false;
++      for (final user in {sender, me}) {
++        final member =
++            await client.getRoomStateWithKey(room.id, EventTypes.RoomMember, user);
++        if (member['membership'] != Membership.join.name) return false;
++      }
++      return true;
++    } catch (e) {
++      print('[FindDevice] Membership check failed: $e');
++      return false;
++    }
++  }
++}
++
++class RingStatus {
++  /// `ringing`, `found` or `timeout`.
++  final String state;
++  final DateTime at;
++  const RingStatus(this.state, this.at);
++}
+diff --git a/lib/services/find_device/find_device_channel.dart b/lib/services/find_device/find_device_channel.dart
+new file mode 100644
+index 0000000..b327419
+--- /dev/null
++++ b/lib/services/find_device/find_device_channel.dart
+@@ -0,0 +1,62 @@
++import 'package:flutter/services.dart';
++
++/// Dart side of android/.../finddevice/FindDevicePlugin.kt.
++class FindDeviceChannel {
++  static const _channel = MethodChannel('app.familyfinder/find_device');
++
++  /// Registers with the installed UnifiedPush distributor. Returns the
++  /// distributor package, or null when none is installed.
++  static Future<String?> registerPush() =>
++      _channel.invokeMethod<String>('registerPush');
++
++  static Future<PushStatus> pushStatus() async {
++    final map = await _channel.invokeMapMethod<String, dynamic>('pushStatus') ?? {};
++    return PushStatus(
++      endpoint: map['endpoint'] as String?,
++      failure: map['failure'] as String?,
++      distributor: map['distributor'] as String?,
++    );
++  }
++
++  /// Returns true only when this call started ringing (acknowledge once).
++  static Future<bool> startAlarm({
++    required String requestId,
++    required String roomId,
++    required String requester,
++  }) async =>
++      await _channel.invokeMethod<bool>('startAlarm',
++          {'requestId': requestId, 'roomId': roomId, 'requester': requester}) ??
++      false;
++
++  static Future<void> stopAlarm() => _channel.invokeMethod('stopAlarm');
++
++  static Future<bool> isAlarmRinging() async =>
++      await _channel.invokeMethod<bool>('isAlarmRinging') ?? false;
++
++  /// Push handler engine only: route pushes to [onPush], then tell native to
++  /// release queued payloads.
++  static Future<void> listenForPushes(
++    Future<void> Function(String payload, bool appInForeground) onPush, {
++    required Future<void> Function(String roomId, String requestId, String reason)
++        onAlarmStopped,
++  }) async {
++    _channel.setMethodCallHandler((call) async {
++      final args = Map<String, dynamic>.from(call.arguments as Map);
++      if (call.method == 'onPush') {
++        await onPush(args['payload'] as String, args['appInForeground'] as bool? ?? false);
++      } else if (call.method == 'onAlarmStopped') {
++        await onAlarmStopped(
++            args['roomId'] as String, args['requestId'] as String, args['reason'] as String);
++      }
++      return null;
++    });
++    await _channel.invokeMethod('pushReady');
++  }
++}
++
++class PushStatus {
++  final String? endpoint;
++  final String? failure;
++  final String? distributor;
++  const PushStatus({this.endpoint, this.failure, this.distributor});
++}
+diff --git a/lib/services/find_device/find_device_router.dart b/lib/services/find_device/find_device_router.dart
+new file mode 100644
+index 0000000..60a04d8
+--- /dev/null
++++ b/lib/services/find_device/find_device_router.dart
+@@ -0,0 +1,60 @@
++import 'dart:async';
++import 'dart:convert';
++
++import 'package:matrix/matrix.dart';
++
++import '../message_processor.dart';
++import 'device_commands.dart';
++import 'find_device_channel.dart';
++
++/// Event reference carried by a Matrix push in `event_id_only` format.
++class PushedEvent {
++  final String eventId;
++  final String roomId;
++  const PushedEvent(this.eventId, this.roomId);
++
++  static PushedEvent? parse(String payload) {
++    try {
++      final notification = (jsonDecode(payload) as Map)['notification'] as Map?;
++      final eventId = notification?['event_id'];
++      final roomId = notification?['room_id'];
++      if (eventId is String && roomId is String) return PushedEvent(eventId, roomId);
++    } catch (_) {}
++    return null;
++  }
++}
++
++/// Handles pushes in the app's main engine while it is alive, using the app's
++/// own Matrix client and [MessageProcessor] (which decrypts, enforces the
++/// contact/sharing gates, and acts on find-device commands). Only one client
++/// may send from a device: a second one desynchronizes encryption sessions.
++class FindDeviceRouter {
++  static bool _attached = false;
++
++  static Future<void> attachMainEngine(Client client, MessageProcessor processor) async {
++    if (_attached) return;
++    _attached = true;
++    unawaited(DeviceCommands.ensureNearbyPermission());
++    try {
++      await FindDeviceChannel.listenForPushes(
++        (payload, appInForeground) async {
++          final pushed = PushedEvent.parse(payload);
++          if (pushed == null) return;
++          try {
++            final event = await client.getOneRoomEvent(pushed.roomId, pushed.eventId);
++            await processor.processEvent(pushed.roomId, event);
++          } catch (e) {
++            print('[FindDevice] Main engine push handling failed: $e');
++          }
++        },
++        onAlarmStopped: (roomId, requestId, reason) async {
++          final room = client.getRoomById(roomId);
++          if (room != null) await DeviceCommands.sendStatus(room, requestId, reason);
++        },
++      );
++    } catch (e) {
++      _attached = false;
++      print('[FindDevice] Could not attach main engine push handler: $e');
++    }
++  }
++}
+diff --git a/lib/services/find_device/push_background.dart b/lib/services/find_device/push_background.dart
+new file mode 100644
+index 0000000..d351fc2
+--- /dev/null
++++ b/lib/services/find_device/push_background.dart
+@@ -0,0 +1,85 @@
++import 'dart:ui';
++
++import 'package:flutter/widgets.dart';
++import 'package:libre_location/libre_location.dart' as libre;
++import 'package:matrix/matrix.dart';
++
++import '../android_background_task.dart';
++import 'device_commands.dart';
++import 'find_device_channel.dart';
++import 'find_device_router.dart';
++
++/// Entrypoint of the headless engine started by PushDispatcher.kt for every
++/// UnifiedPush message (a Matrix push with `event_id_only` format). Fetches
++/// and decrypts the event, then acts on find-device commands — even when the
++/// app is closed, like Samsung Find's push-delivered device operations.
++@pragma('vm:entry-point')
++Future<void> findDevicePushMain() async {
++  WidgetsFlutterBinding.ensureInitialized();
++  DartPluginRegistrant.ensureInitialized();
++  print('[FindDevice] Push handler isolate started');
++  await FindDeviceChannel.listenForPushes(_onPush, onAlarmStopped: _onAlarmStopped);
++}
++
++Future<void> _onPush(String payload, bool appInForeground) async {
++  try {
++    final pushed = PushedEvent.parse(payload);
++    if (pushed == null) return;
++    final eventId = pushed.eventId;
++    final roomId = pushed.roomId;
++    print('[FindDevice] Push for event in $roomId');
++
++    final client = await backgroundMatrixClient();
++    if (client == null) return;
++
++    final room = client.getRoomById(roomId) ?? Room(id: roomId, client: client);
++    var event = Event.fromMatrixEvent(await client.getOneRoomEvent(roomId, eventId), room);
++    if (event.type == EventTypes.Encrypted && client.encryption != null) {
++      event = await client.encryption!.decryptRoomEvent(event);
++    }
++    if (event.type != EventTypes.Message) return;
++
++    if (await DeviceCommands.handle(event, room, client.userID)) return;
++
++    // The open app answers location requests itself; answer only when closed.
++    if (!appInForeground && event.content['msgtype'] == 'm.location.request') {
++      await _answerLocationRequest(event, client.userID);
++    }
++  } catch (e, st) {
++    print('[FindDevice] Push handling failed: $e\n$st');
++  }
++}
++
++Future<void> _onAlarmStopped(String roomId, String requestId, String reason) async {
++  final client = await backgroundMatrixClient();
++  final room = client?.getRoomById(roomId);
++  if (room == null) return;
++  await DeviceCommands.sendStatus(room, requestId, reason);
++}
++
++Future<void> _answerLocationRequest(Event event, String? me) async {
++  final requested = event.content['requested_users'];
++  if (requested is List && !requested.contains(me)) return;
++  if (event.senderId == me ||
++      DateTime.now().difference(event.originServerTs) > DeviceCommands.maxCommandAge) {
++    return;
++  }
++  final fix = await libre.LibreLocation.getCurrentPosition(
++    accuracy: libre.Accuracy.high,
++    samples: 1,
++    timeout: 20,
++    maximumAge: 10000,
++    persist: false,
++  );
++  await processBackgroundLocation(
++    fix.latitude,
++    fix.longitude,
++    fix.accuracy,
++    DateTime.now(),
++    fix.isMoving,
++    speed: fix.speed,
++    heading: fix.heading,
++    batteryLevel: fix.battery?.level,
++    isCharging: fix.battery?.isCharging,
++  );
++}
+diff --git a/test/services/find_device/device_commands_test.dart b/test/services/find_device/device_commands_test.dart
+new file mode 100644
+index 0000000..1618f82
+--- /dev/null
++++ b/test/services/find_device/device_commands_test.dart
+@@ -0,0 +1,44 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:grid_frontend/services/find_device/device_commands.dart';
++import 'package:matrix/matrix.dart';
++import 'package:mocktail/mocktail.dart';
++
++class MockRoom extends Mock implements Room {}
++
++Room _room() {
++  final room = MockRoom();
++  when(() => room.id).thenReturn('!room:localhost');
++  return room;
++}
++
++Event _status(String sender, String state, DateTime at) => Event(
++      content: {
++        'msgtype': DeviceCommands.ringStatusMsgtype,
++        'state': state,
++        'request_id': r'$req',
++      },
++      type: EventTypes.Message,
++      eventId: r'$evt',
++      senderId: sender,
++      originServerTs: at,
++      room: _room(),
++    );
++
++void main() {
++  setUp(() => DeviceCommands.ringStatus.value = {});
++
++  test('records the latest ring status per contact', () {
++    DeviceCommands.handleStatus(_status('@b:localhost', 'ringing', DateTime.now()));
++    DeviceCommands.handleStatus(_status('@b:localhost', 'found', DateTime.now()));
++    expect(DeviceCommands.ringStatus.value['@b:localhost']?.state, 'found');
++  });
++
++  test('ignores stale statuses and other message types', () {
++    DeviceCommands.handleStatus(_status(
++        '@b:localhost', 'ringing', DateTime.now().subtract(const Duration(hours: 1))));
++    final other = _status('@b:localhost', 'ringing', DateTime.now())
++      ..content['msgtype'] = 'm.location';
++    DeviceCommands.handleStatus(other);
++    expect(DeviceCommands.ringStatus.value, isEmpty);
++  });
++}
+diff --git a/test/services/find_device/find_device_router_test.dart b/test/services/find_device/find_device_router_test.dart
+new file mode 100644
+index 0000000..8031800
+--- /dev/null
++++ b/test/services/find_device/find_device_router_test.dart
+@@ -0,0 +1,16 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:grid_frontend/services/find_device/find_device_router.dart';
++
++void main() {
++  test('parses event_id_only Matrix push payloads', () {
++    final pushed = PushedEvent.parse(
++        '{"notification":{"event_id":"\$e","room_id":"!r:localhost","counts":{"unread":1}}}');
++    expect(pushed?.eventId, r'$e');
++    expect(pushed?.roomId, '!r:localhost');
++  });
++
++  test('rejects payloads without an event reference', () {
++    expect(PushedEvent.parse('{"notification":{"counts":{}}}'), isNull);
++    expect(PushedEvent.parse('not json'), isNull);
++  });
++}
